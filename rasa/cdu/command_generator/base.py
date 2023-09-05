@@ -12,7 +12,8 @@ class CommandGenerator:
 
     Parses a message and returns a list of commands. The commands are then
     executed and will lead to tracker state modifications and action
-    predictions."""
+    predictions.
+    """
 
     def process(
         self,
@@ -20,10 +21,18 @@ class CommandGenerator:
         tracker: Optional[DialogueStateTracker] = None,
         flows: Optional[FlowsList] = None,
     ) -> List[Message]:
-        """Process a list of messages. For each message predict commands.
+        """Processes a list of messages. For each message predicts commands.
 
-        The result of the generation is added to the message as a list of
+        The result of the prediction is added to the message as a list of
         commands.
+
+        Args:
+            message: The message to predict commands for.
+            tracker: The tracker containing the conversation history up to now.
+            flows: The flows to use for command prediction.
+
+        Returns:
+            A list of messages with the predicted commands.
         """
         for message in messages:
             commands = self.predict_commands(message, tracker, flows)
@@ -37,7 +46,7 @@ class CommandGenerator:
         tracker: Optional[DialogueStateTracker] = None,
         flows: Optional[FlowsList] = None,
     ) -> List[Command]:
-        """Predict commands for a single message.
+        """Predicts commands for a single message.
 
         Args:
             message: The message to predict commands for.

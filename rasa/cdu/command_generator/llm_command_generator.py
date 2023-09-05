@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional, List, Union
 
 from jinja2 import Template
 import structlog
+
 from rasa.cdu.command_generator.base import CommandGenerator
 from rasa.cdu.commands import (
     Command,
@@ -17,7 +18,6 @@ from rasa.cdu.commands import (
     ClarifyCommand,
 )
 from rasa.cdu.conversation_patterns import FLOW_PATTERN_COLLECT_INFORMATION
-
 from rasa.core.policies.flow_policy import DialogueStack
 from rasa.engine.graph import GraphComponent, ExecutionContext
 from rasa.engine.recipes.default_recipe import DefaultV1Recipe
@@ -32,9 +32,7 @@ from rasa.shared.core.slots import (
     Slot,
     bool_from_any,
 )
-from rasa.shared.nlu.constants import (
-    TEXT,
-)
+from rasa.shared.nlu.constants import TEXT
 from rasa.shared.nlu.training_data.message import Message
 from rasa.shared.nlu.training_data.training_data import TrainingData
 from rasa.shared.utils.llm import (
@@ -48,9 +46,6 @@ DEFAULT_COMMAND_PROMPT_TEMPLATE = importlib.resources.read_text(
     "rasa.cdu.command_generator", "command_prompt_template.jinja2"
 )
 
-structlogger = structlog.get_logger()
-
-
 DEFAULT_LLM_CONFIG = {
     "_type": "openai",
     "request_timeout": 7,
@@ -60,6 +55,8 @@ DEFAULT_LLM_CONFIG = {
 
 LLM_CONFIG_KEY = "llm"
 
+structlogger = structlog.get_logger()
+
 
 @DefaultV1Recipe.register(
     [
@@ -68,6 +65,11 @@ LLM_CONFIG_KEY = "llm"
     is_trainable=True,
 )
 class LLMCommandGenerator(GraphComponent, CommandGenerator):
+    """An LLM based command generator.
+
+     # TODO: add description to the docstring.
+    
+    """
     @staticmethod
     def get_default_config() -> Dict[str, Any]:
         """The component's default config (see parent class for full docstring)."""
@@ -98,9 +100,6 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
         """Creates a new untrained component (see parent class for full docstring)."""
         return cls(config, model_storage, resource)
 
-    def persist(self) -> None:
-        pass
-
     @classmethod
     def load(
         cls,
@@ -114,28 +113,12 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
         return cls(config, model_storage, resource)
 
     def train(self, training_data: TrainingData) -> Resource:
-        """Train the intent classifier on a data set."""
+        """Trains the intent classifier on a data set."""
         self.persist()
         return self._resource
 
-    def _generate_action_list_using_llm(self, prompt: str) -> Optional[str]:
-        """Use LLM to generate a response.
-
-        Args:
-            prompt: the prompt to send to the LLM
-
-        Returns:
-            generated text
-        """
-        llm = llm_factory(self.config.get(LLM_CONFIG_KEY), DEFAULT_LLM_CONFIG)
-
-        try:
-            return llm(prompt)
-        except Exception as e:
-            # unfortunately, langchain does not wrap LLM exceptions which means
-            # we have to catch all exceptions here
-            structlogger.error("llm_command_generator.llm.error", error=e)
-            return None
+    def persist(self) -> None:
+        pass
 
     def predict_commands(
         self,
@@ -143,6 +126,7 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
         tracker: Optional[DialogueStateTracker] = None,
         flows: Optional[FlowsList] = None,
     ) -> List[Command]:
+        """TODO: add docstring"""
         if flows is None or tracker is None:
             # cannot do anything if there are no flows or no tracker
             return []
@@ -163,59 +147,84 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
 
         return commands
 
-    @staticmethod
-    def is_none_value(value: str) -> bool:
-        return value in {
-            "[missing information]",
-            "[missing]",
-            "None",
-            "undefined",
-            "null",
+    def render_template(
+        self, message: Message, tracker: DialogueStateTracker, flows: FlowsList
+    ) -> str:
+        """TODO: add docstring"""
+        flows_without_patterns = FlowsList(
+            [f for f in flows.underlying_flows if not f.is_handling_pattern()]
+        )
+        top_relevant_frame = DialogueStack.top_frame_on_tracker(
+            tracker, ignore_frame=FLOW_PATTERN_COLLECT_INFORMATION
+        )
+        top_flow = top_relevant_frame.flow(flows) if top_relevant_frame else None
+        current_step = top_relevant_frame.step(flows) if top_relevant_frame else None
+        if top_flow is not None:
+            flow_slots = [
+                {
+                    "name": info_step.collect_information,
+                    "value": self.slot_value(tracker, info_step.collect_information),
+                    "type": tracker.slots[info_step.collect_information].type_name,
+                    "allowed_values": self.allowed_values_for_slot(
+                        tracker.slots[info_step.collect_information]
+                    ),
+                    "description": info_step.description,
+                }
+                for info_step in top_flow.get_collect_information_steps()
+                if self.is_extractable(info_step, tracker, current_step)
+            ]
+        else:
+            flow_slots = []
+
+        collect_information, collect_information_description = (
+            (current_step.collect_information, current_step.description)
+            if isinstance(current_step, CollectInformationFlowStep)
+            else (None, None)
+        )
+        current_conversation = tracker_as_readable_transcript(tracker)
+        latest_user_message = sanitize_message_for_prompt(message.get(TEXT))
+        current_conversation += f"\nUSER: {latest_user_message}"
+
+        inputs = {
+            "available_flows": self.create_template_inputs(
+                flows_without_patterns, tracker
+            ),
+            "current_conversation": current_conversation,
+            "flow_slots": flow_slots,
+            "current_flow": top_flow.id if top_flow is not None else None,
+            "collect_information": collect_information,
+            "collect_information_description": collect_information_description,
+            "user_message": latest_user_message,
         }
 
-    @staticmethod
-    def clean_extracted_value(value: str) -> str:
-        """Clean up the extracted value from the llm."""
-        # replace any combination of single quotes, double quotes, and spaces
-        # from the beginning and end of the string
-        return re.sub(r"^['\"\s]+|['\"\s]+$", "", value)
+        return Template(self.prompt_template).render(**inputs)
 
-    @classmethod
-    def coerce_slot_value(
-        cls, slot_value: str, slot_name: str, tracker: DialogueStateTracker
-    ) -> Union[str, bool, float, None]:
-        """Coerce the slot value to the correct type.
-
-        Tries to coerce the slot value to the correct type. If the
-        conversion fails, `None` is returned.
+    def _generate_action_list_using_llm(self, prompt: str) -> Optional[str]:
+        """Uses the configured LLM to generate a response.
 
         Args:
-            value: the value to coerce
-            slot_name: the name of the slot
-            tracker: the tracker
+            prompt: the prompt to send to the LLM
 
         Returns:
-            the coerced value or `None` if the conversion failed."""
-        nullable_value = slot_value if not cls.is_none_value(slot_value) else None
-        if slot_name not in tracker.slots:
-            return nullable_value
+            generated text
+        """
+        llm = llm_factory(self.config.get(LLM_CONFIG_KEY), DEFAULT_LLM_CONFIG)
 
-        slot = tracker.slots[slot_name]
-        if isinstance(slot, BooleanSlot):
-            return bool_from_any(nullable_value)
-        elif isinstance(slot, FloatSlot):
-            try:
-                return float(nullable_value)
-            except ValueError:
-                return None
-        else:
-            return nullable_value
-
+        try:
+            return llm(prompt)
+        except Exception as e:
+            # Langchain does not wrap LLM exceptions which means
+            # we have to catch all exceptions here
+            structlogger.error("llm_command_generator.llm.error", error=e)
+            return None
+   
     @classmethod
     def parse_commands(
         cls, actions: Optional[str], tracker: DialogueStateTracker
     ) -> List[Command]:
-        """Parse the actions returned by the llm into intent and entities."""
+        """Parse the actions returned by the llm into intent and entities.
+        #TODO: add arguments and returns.
+        """
         if not actions:
             return [ErrorCommand()]
 
@@ -261,10 +270,60 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
 
         return commands
 
+    @staticmethod
+    def clean_extracted_value(value: str) -> str:
+        """Clean up the extracted value from the llm."""
+        # replace any combination of single quotes, double quotes, and spaces
+        # from the beginning and end of the string
+        return re.sub(r"^['\"\s]+|['\"\s]+$", "", value)
+
+    @classmethod
+    def coerce_slot_value(
+        cls, slot_value: str, slot_name: str, tracker: DialogueStateTracker
+    ) -> Union[str, bool, float, None]:
+        """Coerce the slot value to the correct type.
+
+        Tries to coerce the slot value to the correct type. If the
+        conversion fails, `None` is returned.
+
+        Args:
+            value: the value to coerce
+            slot_name: the name of the slot
+            tracker: the tracker
+
+        Returns:
+            the coerced value or `None` if the conversion failed."""
+        nullable_value = slot_value if not cls.is_none_value(slot_value) else None
+        if slot_name not in tracker.slots:
+            return nullable_value
+
+        slot = tracker.slots[slot_name]
+        if isinstance(slot, BooleanSlot):
+            return bool_from_any(nullable_value)
+        elif isinstance(slot, FloatSlot):
+            try:
+                return float(nullable_value)
+            except ValueError:
+                return None
+        else:
+            return nullable_value
+        
+    @staticmethod
+    def is_none_value(value: str) -> bool:
+        """TODO: add docstring"""
+        return value in {
+            "[missing information]",
+            "[missing]",
+            "None",
+            "undefined",
+            "null",
+        }
+
     @classmethod
     def create_template_inputs(
         cls, flows: FlowsList, tracker: DialogueStateTracker
     ) -> List[Dict[str, Any]]:
+        """TODO: add docstring."""
         result = []
         for flow in flows.underlying_flows:
             # TODO: check if we should filter more flows; e.g. flows that are
@@ -273,9 +332,9 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
             if not flow.is_rasa_default_flow():
 
                 slots_with_info = [
-                    {"name": q.collect_information, "description": q.description}
-                    for q in flow.get_collect_information_steps()
-                    if cls.is_extractable(q, tracker)
+                    {"name": info_step.collect_information, "description": info_step.description}
+                    for info_step in flow.get_collect_information_steps()
+                    if cls.is_extractable(info_step, tracker)
                 ]
                 result.append(
                     {
@@ -288,7 +347,7 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
 
     @staticmethod
     def is_extractable(
-        q: CollectInformationFlowStep,
+        info_step: CollectInformationFlowStep,
         tracker: DialogueStateTracker,
         current_step: Optional[FlowStep] = None,
     ) -> bool:
@@ -297,20 +356,20 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
         A collect_information slot can only be filled if the slot exist
         and either the collect_information has been asked already or the
         slot has been filled already."""
-        slot = tracker.slots.get(q.collect_information)
+        slot = tracker.slots.get(info_step.collect_information)
         if slot is None:
             return False
 
         return (
             # we can fill because this is a slot that can be filled ahead of time
-            not q.ask_before_filling
+            not info_step.ask_before_filling
             # we can fill because the slot has been filled already
             or slot.has_been_set
             # we can fill because the is currently getting asked
             or (
                 current_step is not None
                 and isinstance(current_step, CollectInformationFlowStep)
-                and current_step.collect_information == q.collect_information
+                and current_step.collect_information == info_step.collect_information
             )
         )
 
@@ -331,54 +390,3 @@ class LLMCommandGenerator(GraphComponent, CommandGenerator):
             return "undefined"
         else:
             return str(slot_value)
-
-    def render_template(
-        self, message: Message, tracker: DialogueStateTracker, flows: FlowsList
-    ) -> str:
-        flows_without_patterns = FlowsList(
-            [f for f in flows.underlying_flows if not f.is_handling_pattern()]
-        )
-        top_relevant_frame = DialogueStack.top_frame_on_tracker(
-            tracker, ignore_frame=FLOW_PATTERN_COLLECT_INFORMATION
-        )
-        top_flow = top_relevant_frame.flow(flows) if top_relevant_frame else None
-        current_step = top_relevant_frame.step(flows) if top_relevant_frame else None
-        if top_flow is not None:
-            flow_slots = [
-                {
-                    "name": q.collect_information,
-                    "value": self.slot_value(tracker, q.collect_information),
-                    "type": tracker.slots[q.collect_information].type_name,
-                    "allowed_values": self.allowed_values_for_slot(
-                        tracker.slots[q.collect_information]
-                    ),
-                    "description": q.description,
-                }
-                for q in top_flow.get_collect_information_steps()
-                if self.is_extractable(q, tracker, current_step)
-            ]
-        else:
-            flow_slots = []
-
-        collect_information, collect_information_description = (
-            (current_step.collect_information, current_step.description)
-            if isinstance(current_step, CollectInformationFlowStep)
-            else (None, None)
-        )
-        current_conversation = tracker_as_readable_transcript(tracker)
-        latest_user_message = sanitize_message_for_prompt(message.get(TEXT))
-        current_conversation += f"\nUSER: {latest_user_message}"
-
-        inputs = {
-            "available_flows": self.create_template_inputs(
-                flows_without_patterns, tracker
-            ),
-            "current_conversation": current_conversation,
-            "flow_slots": flow_slots,
-            "current_flow": top_flow.id if top_flow is not None else None,
-            "collect_information": collect_information,
-            "collect_information_description": collect_information_description,
-            "user_message": latest_user_message,
-        }
-
-        return Template(self.prompt_template).render(**inputs)
